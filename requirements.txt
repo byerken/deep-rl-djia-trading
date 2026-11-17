@@ -1,0 +1,11 @@
+pandas
+numpy
+pyarrow
+scipy
+matplotlib
+jupyter
+wrds
+gymnasium
+torch
+stable-baselines3
+pytest

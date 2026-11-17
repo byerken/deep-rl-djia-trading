@@ -1,0 +1,8 @@
+# WRDS data is licensed: rebuild it with 1_data_collection.ipynb
+data/*.parquet
+# trained agents (~1 GB): rebuild with train.py
+models/
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
