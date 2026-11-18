@@ -49,3 +49,20 @@ def test_put_protects_in_a_crash():
 def test_black_scholes_put():
     assert abs(bs_put(100, 100, 1, 0.05, 0.2) - 5.5735) < 1e-3
     assert bs_put(100, 110, 0, 0.05, 0.2) == 10
+
+
+def test_caps_of_the_gentler_rules():
+    # 'half' keeps at most 50% in stocks while turbulent; 'volscale' at most the volatility cap; all rules stay consistent
+    rng = np.random.default_rng(0)
+    for rule in ['half', 'volscale', 'put95', 'put3m']:
+        env = TradingEnv(data, '2008-06-01', '2009-06-01', rule, threshold=-np.inf)
+        env.reset()
+        done = False
+        while not done:
+            _, _, done, _, info = env.step(rng.uniform(0, 1, N))     # the agent wants to buy every day
+            stocks = env.h @ data.px[env.t] / info['value']
+            if rule == 'half':
+                assert stocks <= 0.5 + 1e-3     # + a hair: the fee on the sale shrinks the portfolio
+            if rule == 'volscale':
+                assert stocks <= data.vol_cap[env.t - 1] + 1e-3
+            assert np.isfinite(info['value']) and info['value'] > 0 and (env.h >= -1e-9).all()

@@ -52,8 +52,9 @@ class FTATD3Policy(TD3Policy):
         return critic
 
 
-def train_agent(name, env, fta, seed):
-    """Train one agent with the paper's settings (stable-baselines defaults, 64x64 networks)."""
+def train_agent(name, env, fta, seed, steps=None):
+    """Train one agent with the paper's settings (stable-baselines defaults, 64x64 networks) for `steps`
+    (default: the paper's training steps)."""
     torch.set_num_threads(1)
     kw = dict(seed=seed, verbose=0, device='cpu')
     if name == 'a2c':
@@ -64,7 +65,7 @@ def train_agent(name, env, fta, seed):
         noise = OrnsteinUhlenbeckActionNoise(np.zeros(30), 0.5 * np.ones(30))   # paper: OU noise, sigma 0.5
         model = DDPG(FTATD3Policy if fta else 'MlpPolicy', env, action_noise=noise, buffer_size=50_000,
                      policy_kwargs={'net_arch': [64, 64]}, **kw)
-    return model.learn(TIMESTEPS[name])
+    return model.learn(steps or TIMESTEPS[name])
 
 
 def load_agent(path):

@@ -17,6 +17,7 @@ MAX_TRADE = 0.01    # a stock can be traded for at most 1% of the portfolio per 
 PUT_DAYS = 21       # 'put' rule: buy 1-month at-the-money SPY puts ...
 PUT_COST = 0.01     # ... paying 1% of the premium on top as trading cost
 RULES = ['none', 'sell', 'put']   # what to do when turbulence >= threshold
+EXTRA_RULES = ['half', 'put95', 'put3m', 'volscale']   # gentler or cheaper variants, for the investigation
 
 
 def load_data():
@@ -62,6 +63,9 @@ def load_data():
     djia = pd.Series((w * np.nan_to_num(r)).sum(axis=1) / w.sum(axis=1).clip(min=1e-9), index=dates)
 
     spy = prices[prices.ticker == 'SPY'].set_index('date').close
+    # volatility scaling (Moreira & Muir 2017): hold at most (usual vol / recent vol) in stocks
+    vol = djia.rolling(21).std()
+    vol_cap = (vol.expanding().median() / vol).clip(upper=1).fillna(1)
     return SimpleNamespace(
         dates=dates,
         slot=slot,                                            # permno in each slot
@@ -76,14 +80,18 @@ def load_data():
         rf=rf.reindex(dates).ffill().values,                  # daily risk-free return
         spy=spy.reindex(dates).ffill().values,
         djia=djia,
+        vol_cap=vol_cap.values,
     )
 
 
-def turbulence_threshold(data, val_start):
+def turbulence_threshold(data, val_start, q=None):
     """The paper's rule, using only data before the validation window:
-    99th percentile of past turbulence, or the 90th if the last quarter was already turbulent."""
+    99th percentile of past turbulence, or the 90th if the last quarter was already turbulent.
+    With q: simply the q-quantile of past turbulence (for the threshold sweep)."""
     past = data.turbulence[:data.dates.searchsorted(pd.Timestamp(val_start))]
     past = past[~np.isnan(past)]
+    if q is not None:
+        return np.quantile(past, q)
     q90, q99 = np.quantile(past, [0.90, 0.99])
     return q90 if past[-63:].mean() > q90 else q99
 
@@ -107,10 +115,12 @@ class TradingEnv(gym.Env):
     Reward: the day's portfolio return in %.
     rule: what happens when turbulence >= threshold. 'none': nothing; 'sell': sell everything and
     don't buy (the paper); 'put': keep the stocks and buy 1-month SPY puts as insurance.
+    Extra rules: 'half': at most 50% in stocks; 'put95': 5% out-of-the-money puts; 'put3m': 3-month puts;
+    'volscale': every day (not only when turbulent) at most usual vol / recent vol in stocks.
     """
 
-    def __init__(self, data, start, end, rule='none', threshold=np.inf):
-        self.d, self.rule, self.threshold = data, rule, threshold
+    def __init__(self, data, start, end, rule='none', threshold=np.inf, fee=FEE):
+        self.d, self.rule, self.threshold, self.fee = data, rule, threshold, fee
         self.t_start = max(data.dates.searchsorted(pd.Timestamp(start)) - 1, 0)   # state day before the first trading day
         self.t_end = data.dates.searchsorted(pd.Timestamp(end)) - 1               # last trading day before `end`
         self.observation_space = gym.spaces.Box(-10, 10, (1 + 6 * N,), np.float32)
@@ -130,33 +140,45 @@ class TradingEnv(gym.Env):
         return {'cash': self.cash, 'h': self.h.copy(), 'put': self.put}
 
     def step(self, action):
-        d = self.d
+        d, fee = self.d, self.fee
         turbulent = d.turbulence[self.t] >= self.threshold    # known at the close of the state day
+        cap = d.vol_cap[self.t] if self.rule == 'volscale' else 0.5 if turbulent and self.rule == 'half' else 1
         t = self.t = self.t + 1
+        self.log = {'traded': 0.0, 'put_paid': 0.0, 'put_payoff': 0.0}
 
         # 1. a stock that left the DJIA or delisted is sold (its slot then belongs to the newcomer)
         gone = (d.slot[t] != d.slot[t - 1]) | ~d.tradable[t]
-        self.cash += self.h[gone] @ d.px_carry[t, gone] * (1 - FEE)
+        self.cash += self.h[gone] @ d.px_carry[t, gone] * (1 - fee)
+        self.log['traded'] += self.h[gone] @ d.px_carry[t, gone]
         self.h[gone] = 0
 
         # 2. an expired put pays out
         if self.put and t >= self.put['expiry']:
-            self.cash += self.put['q'] * max(self.put['K'] - d.spy[t], 0)
+            self.log['put_payoff'] = self.put['q'] * max(self.put['K'] - d.spy[t], 0)
+            self.cash += self.log['put_payoff']
             self.put = None
 
         # 3. crash rule, then the agent's trades
         if turbulent and self.rule == 'sell':
-            self.cash += self.h @ d.px[t] * (1 - FEE)
-            self.h[:] = 0
+            cap = 0
         else:
-            if turbulent and self.rule == 'put' and self.put is None:
+            if turbulent and self.rule.startswith('put') and self.put is None:
                 self._buy_put(t)
             self._trade(np.asarray(action), t)
+        stocks = self.h @ d.px[t]
+        if stocks > cap * self._value():        # sell down to the cap (sell rule: cap 0 = sell everything)
+            sold = stocks - cap * self._value()
+            self.h *= 1 - sold / stocks
+            self.cash += sold * (1 - fee)
+            self.log['traded'] += sold
 
         new_value = self._value()
         reward = 100 * (new_value / self.value - 1)
         self.value = new_value
-        return self._obs(), reward, t >= self.t_end, False, {'value': new_value, 'turbulent': turbulent}
+        info = {'value': new_value, 'turbulent': turbulent, 'cash': self.cash / new_value,
+                'held': int((self.h * d.px[t] > 0.001 * new_value).sum()), 'turnover': self.log['traded'] / new_value,
+                'put_paid': self.log['put_paid'] / new_value, 'put_payoff': self.log['put_payoff'] / new_value}
+        return self._obs(), reward, t >= self.t_end, False, info
 
     def _trade(self, action, t):
         """Sell first, then buy (as in the paper). If cash runs out, all buys are scaled down."""
@@ -164,22 +186,26 @@ class TradingEnv(gym.Env):
         amount = np.where(self.d.tradable[t], action, 0) * MAX_TRADE * self._value()   # $ per stock
         sell = np.minimum(-amount.clip(max=0), self.h * price)
         self.h -= sell / price
-        self.cash += sell.sum() * (1 - FEE)
+        self.cash += sell.sum() * (1 - self.fee)
         buy = amount.clip(min=0)
-        budget = max(self.cash, 0) / (1 + FEE)
+        budget = max(self.cash, 0) / (1 + self.fee)
         if buy.sum() > budget:
             buy *= budget / buy.sum()
         self.h += buy / price
-        self.cash -= buy.sum() * (1 + FEE)
+        self.cash -= buy.sum() * (1 + self.fee)
+        self.log['traded'] += sell.sum() + buy.sum()
 
     def _buy_put(self, t):
-        """Insure the stock positions with at-the-money SPY puts (priced with VIX and the T-bill rate)."""
+        """Insure the stock positions with SPY puts (priced with VIX and the T-bill rate).
+        'put': 1-month at the money; 'put95': 1-month, strike 5% below; 'put3m': 3-month at the money."""
         S, stocks = self.d.spy[t], self.h @ self.d.px[t]
         if stocks <= 0:
             return
-        q = stocks / S
-        self.cash -= q * bs_put(S, S, PUT_DAYS / 252, self.d.rf[t] * 252, self.d.vix[t] / 100) * (1 + PUT_COST)
-        self.put = {'q': q, 'K': S, 'expiry': t + PUT_DAYS}
+        q, K = stocks / S, S * (0.95 if self.rule == 'put95' else 1)
+        days = 63 if self.rule == 'put3m' else PUT_DAYS
+        self.log['put_paid'] = q * bs_put(S, K, days / 252, self.d.rf[t] * 252, self.d.vix[t] / 100) * (1 + PUT_COST)
+        self.cash -= self.log['put_paid']
+        self.put = {'q': q, 'K': K, 'expiry': t + days}
 
     def _value(self):
         d, t = self.d, self.t
@@ -198,14 +224,14 @@ class TradingEnv(gym.Env):
 
 def run_episode(model, env, portfolio=None):
     """Let a trained agent trade through env.
-    Returns a DataFrame (daily return, turbulent flag) and the final portfolio, to carry into the next quarter."""
+    Returns a DataFrame (daily return, turbulent flag, cash share, stocks held, turnover, put premium paid
+    and payoff, the last three as a share of the portfolio) and the final portfolio, to carry into the next quarter."""
     obs, _ = env.reset(options={'portfolio': portfolio})
-    values, turbulent, done = [env.value], [False], False
+    rows, done, start = [], False, env.value
     while not done:
         action, _ = model.predict(obs, deterministic=True)
         obs, _, done, _, info = env.step(action)
-        values.append(info['value'])
-        turbulent.append(info['turbulent'])
-    days = env.d.dates[env.t_start: env.t_end + 1]
-    out = pd.DataFrame({'ret': pd.Series(values).pct_change().values, 'turbulent': turbulent}, index=days)
-    return out.iloc[1:], env.portfolio()
+        rows.append(info)
+    out = pd.DataFrame(rows, index=env.d.dates[env.t_start + 1: env.t_end + 1])
+    out.insert(0, 'ret', out.pop('value').pct_change().fillna(rows[0]['value'] / start - 1))
+    return out, env.portfolio()

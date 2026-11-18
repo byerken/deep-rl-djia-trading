@@ -37,11 +37,20 @@ Out-of-sample trading on 101 test quarters (Oct 2000 – Dec 2025), averaged ove
 |---|---|---|---|---|---|
 | `none`: ignore turbulence | 8.2% | 0.50 | −56.5% | −47% | +81% |
 | `sell`: close out (paper) | 5.6% | 0.43 | −41.5% | −27% | +36% |
-| `put`: keep stocks, buy SPY puts | 6.7% | 0.46 | −50.2% | −37% | +53% |
+| `put`: keep stocks, buy SPY puts | 6.7% | 0.46 | −50.3% | −37% | +53% |
 
-- **Puts vs. selling:** puts beat selling on return and Sharpe ratio, in all 5 seeds of the ensemble and in 27 of the 40 runs.
+- **Puts vs. selling:** puts beat selling on return and Sharpe ratio, in all 5 seeds of the ensemble and in 26 of the 40 runs.
 - **Selling protects best in long crashes.**
 - **Neither rule beats ignoring turbulence.** The rule buys insurance after turbulence has spiked, when it's most expensive: at VIX 83 in March 2020, a 1-month put cost 9.5% of the position.
+
+### Investigation: why? (`6_investigation.ipynb`)
+
+- **The agents learn to hold the market, not to beat it.** They stay almost fully invested in about 17 stocks, beat a random agent (Sharpe 0.37) but not 1/N (0.53) or the DJIA (0.55). Training up to 3× the paper's steps doesn't change that.
+- **Choosing an agent is no better than guessing.** Validation Sharpe has no relation to the next quarter's (rank correlation about 0). The picked agent is the best one 35% of the time (guessing: 33%), and a random pick does as well as the ensemble.
+- **Market noise dwarfs seed noise.** With 20 seeds, the seed-to-seed spread of the 2016–2025 Sharpe ratio is 0.08; the market uncertainty of that number is about 0.31. Over 25 years no strategy differs significantly from the DJIA.
+- **Old data isn't the problem.** Training on only the last 5 years gives the same results.
+- **The crash rule sells after the fall and misses the rebound.** The DJIA has already dropped about 2% before a turbulence signal and gains about 3.3% in the 60 days after. No threshold or gentler rule (half, volatility scaling) beats doing nothing on return. Puts paid back only 39–72 cents per dollar of premium.
+- **FTA, 20 seeds:** the narrower spread seen with 5 seeds was chance (p = 0.58). FTA agents do track the DJIA slightly more closely.
 
 ## How to run
 
@@ -53,11 +62,13 @@ pip install -r requirements.txt
 |---|---|---|
 | `1_data_collection.ipynb` | Downloads DJIA members, prices, VIX and the T-bill rate from WRDS (CRSP, CBOE, Fama-French) | `data/*.parquet` |
 | `2_features.ipynb` | MACD, RSI, CCI, ADX per stock, market features (turbulence, VIX, …), walk-forward folds | `data/asset_features.parquet`, `data/market_features.parquet`, `data/folds.csv` |
-| `python3 train.py` | Trains A2C, PPO and DDPG for 101 quarters × 5 seeds × {baseline, FTA} (~2.5 h on 10 cores) | `models/`, `results/validation.csv` |
-| `python3 backtest.py` | Trades every test quarter in order, for every strategy and crash rule (~10 min) | `results/backtest.parquet`, `results/baselines.parquet` |
+| `python3 train.py` | Trains A2C, PPO and DDPG for 101 quarters × 5 seeds × {baseline, FTA, 5-year rolling window}, plus seeds 5–19 for baseline and FTA from 2016 (~7 h on 10 cores) | `models/`, `results/validation.csv` |
+| `python3 curves.py` | Learning curves: 5 folds × 3 seeds trained to 3× the paper's steps (~40 min) | `results/curves.csv` |
+| `python3 backtest.py` | Trades every test quarter in order, for every strategy and crash rule, plus a sweep of crash rules, thresholds and fees (~20 min) | `results/backtest.parquet`, `results/sweep.parquet`, `results/baselines.parquet` |
 | `3_baseline.ipynb` | Phase 2: the paper's ensemble vs. single agents, DJIA and min-variance | |
 | `4_fta_stability.ipynb` | Idea 1: FTA vs. baseline | |
 | `5_options_vs_close.ipynb` | Idea 2: crash rules `none` / `sell` / `put` | |
+| `6_investigation.ipynb` | Why: learning curves, agent choice vs. guessing, seed vs. market noise, rolling window, fees, crash-rule event study and alternatives | |
 | `python3 -m pytest` | Look-ahead test of the features + accounting tests of the trading env | |
 
 ## Code
@@ -65,10 +76,11 @@ pip install -r requirements.txt
 | File | What's in it |
 |---|---|
 | `features.py` | Indicators and market features. Every value at date *t* uses data up to *t* only. |
-| `env.py` | The trading environment (gymnasium), the turbulence threshold rule and Black-Scholes put pricing |
+| `env.py` | The trading environment (gymnasium), the turbulence threshold rule, Black-Scholes put pricing, and the extra crash rules of the investigation |
 | `agents.py` | The three agents with the paper's settings, and the FTA layer |
 | `train.py` | Walk-forward training and validation, in parallel |
-| `backtest.py` | Out-of-sample trading, benchmarks and performance metrics |
+| `curves.py` | Learning curves (Sharpe ratio in and out of sample vs. training steps) |
+| `backtest.py` | Out-of-sample trading, benchmarks (DJIA, min-variance, 1/N, random agent), the crash-rule sweep and performance metrics |
 
 ## Setup
 
@@ -99,4 +111,4 @@ pip install -r requirements.txt
 - CRSP ends on 2025-12-31, so the 2026 DJIA change isn't covered.
 - The puts are priced with Black-Scholes at VIX volatility, not with real option quotes. VIX is usually a bit above at-the-money implied volatility, so this tends to overstate the cost of insurance.
 - The first folds train on only a few months of data (first test quarter Oct 2000).
-- 5 seeds per setting: enough to compare stability across 101 quarters, but each single quarter's spread is noisy.
+- 5 seeds per setting for the full 2000–2025 period (20 seeds from 2016). Section 3 of `6_investigation.ipynb` shows that seed noise is small next to market noise.
